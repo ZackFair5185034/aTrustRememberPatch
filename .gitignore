@@ -1,0 +1,18 @@
+# 运行时日志
+*.log
+setup.log
+
+# 本地凭据（绝不入库）
+credential.bin
+*.credential
+
+# build-vendor.ps1 的 npm 源目录（vendor/ 是随仓库发布的，不忽略）
+/node_modules/
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.omc/
+.claude/

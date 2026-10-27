@@ -1,0 +1,9 @@
+# 预编译二进制：禁止任何换行符/过滤器转换，否则会被损坏
+*.node binary
+*.bin binary
+
+# 文本统一按 LF 存储
+*.js text eol=lf
+*.ps1 text eol=lf
+*.md text eol=lf
+*.json text eol=lf
