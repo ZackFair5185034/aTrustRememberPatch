@@ -1,0 +1,12 @@
+﻿本目录 = **最新可用版**（对应 GitHub 仓库 ZackFair5185034/aTrustRememberPatch，main 分支）。
+目录名不再带版本号，始终指向「当前最新可用」的那一版。
+
+当前内容：aTrustRememberPatch v1.3
+  · v1.3 修复两处：
+      1) 门户 SPA 重绘登录表单后不再回填（v1.1/v1.2 的 state.applied 粘滞缺陷）
+      2) 登录页勾选框消失 + 密码写进隐藏诱饵框（v1.2 引入的回归）
+  · 渲染逻辑回归测试：node tools\test-renderer.js  → 27 passed, 0 failed
+
+带版本号的发布副本在同级：
+  aTrustRememberPatch-v1.3\   /   aTrustRememberPatch-v1.3.zip
+旧的 v1.1 / v1.2 产物已改名标记为「废弃勿用」。

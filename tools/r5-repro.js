@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 
 const HELPER_FILE = path.join(process.env.APPDATA, "aTrustRemember", "dpapi_helper.js");
-const log = process.argv[2] || path.join(__dirname, "r5-repro.log");
+const log = process.argv[2] || "C:\\Users\\51962\\.minimax\\sessions\\mvs_a5d5870b15864231a1e5aafebe44ca24\\workspace\\aTrustRememberPatch\\r5-repro.log";
 const out = (s) => { try { fs.appendFileSync(log, s + "\n"); } catch (e) {} };
 
 out("parent pid=" + process.pid + " execPath=" + process.execPath + " type=" + process.type);

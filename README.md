@@ -2,21 +2,24 @@
 
 给本机的深信服 aTrust 客户端（2.5.16.20）补上**掉线后自动登录**能力。
 
-> **当前版本：v1.2**（修复「自动注销后没有自动登录」）
+> **当前版本：v1.3**（修复「自动注销后没有自动登录」+ 修复「UI 消失」）
 >
-> - **v1.2** 修复了门户 SPA 重绘登录表单后不再回填的缺陷，并补上 `did-navigate-in-page` 监听。
+> - **v1.3** 修复门户登录页的**诱饵输入块**导致 UI 消失 / 密码写错框的回归（见下方「v1.3 修复记录」）。
+> - **v1.2** 修复门户 SPA 重绘登录表单后不再回填的缺陷，并补上 `did-navigate-in-page` 监听。
 >   现场定位与回归测试见 [§ v1.2 修复记录](#v12-修复记录2026-10-27现场问题自动注销后没有自动登录)。
 > - **v1.1** 交互式一体安装脚本（安装 / 卸载 / 状态）、进程内 DPAPI 主通道。
 > - **v1.0** 初版。
-
+>
+> ⚠️ **v1.2 有回归，请勿使用**（UI 会消失，且密码会写进隐藏的诱饵框）。以 **v1.3** 为准。
+>
 > **状态：已在本机完整验证通过**（冷启动 → 自动回填 → 自动提交 → 登录成功，端到端零人工干预）。
-> v1.2 的渲染逻辑另有 jsdom 回归测试覆盖（23/23 通过，v1.1 对照组 3 项失败）。
+> 渲染逻辑另有 jsdom 回归测试覆盖（**v1.3: 27/27 通过**）。
 
 ---
 
 ## 一、先说清楚原理：aTrust 其实原生就有「记住密码」
 
-逆向结果（证据来自本机托盘日志与门户 SPA 代码）：
+逆向结果（证据见 `../aTrust-掉线自动登录机制分析报告.md`）：
 
 aTrust 客户端**原生实现了「记住密码」**，只是被**服务端开关**关掉了。相关代码在门户 SPA
 `resources\app\web\assets\useInitHelp*.js`：
@@ -210,7 +213,7 @@ input,button { -webkit-appearance: none; border: 0; }
 探针输出（`[aTrustRemember] probe#N:` 行）：
 
 ```json
-{"userFound":true,"userPh":"请输入账号","userVal":"<your-account>",
+{"userFound":true,"userPh":"请输入账号","userVal":"王磊",
  "pswFound":true,"pswId":"password","pswType":"password",
  "btnFound":true,"btnTag":"BUTTON","btnCls":"ix-button ix-button-block ix-button-primary ix-button-lg",
  "btnTxt":"登录","captcha":false,"box":true,
@@ -261,6 +264,58 @@ v1.2 的处理是**三路兜底**：
 >    掉线回到登录页时主窗口既不会被重新激活、凭据也不会推给主窗口。
 >
 > 现场证据见 §「v1.2 修复记录」。
+
+### v1.3 修复记录（现场问题：重新安装后登录页的 UI 消失）
+
+**症状**：升级到 v1.2 后，登录页下方不再出现「记住密码 / 掉线后自动登录」两个勾选框。
+
+**根因**：这是 **v1.2 引入的回归**（v1.1 没有这个问题）。
+v1.2 重构 `findPswInput()` 时，把「按可见性筛选 `type=password`」提到了「按 id 命中」前面，
+结果选中了门户登录组件渲染的**诱饵输入块**：
+
+```html
+<!-- 门户 useInitHelp*.js：真实表单之前先渲染一个诱饵块 -->
+<div class="hidden-box">
+  <input type="text"     tabindex="-1">
+  <input type="password" tabindex="-1">   <!-- 诱饵密码框，排在前面的就是这个 -->
+  <input type="hidden"   name="csrf-token" value="anti-code-scan">
+</div>
+<!-- 真实字段在后面： -->
+<div class="form-input-line user-input"><input placeholder="请输入账号"></div>
+<div class="form-input-line rel"><input id="password" type="password" placeholder="请输入密码"></div>
+```
+
+这个 `.hidden-box` 在页面上「看起来是隐藏的」，但**仍然参与布局**，
+`offsetParent` / `getClientRects()` 都会返回真值 → 可见性筛选把它当成了真密码框。
+
+后果有两处，都很严重：
+
+1. **UI 挂到诱饵块里** → 用户完全看不到两个勾选框；
+2. **密码被写进诱饵框，真实密码框仍然是空的** → 自动登录提交的是空密码 → 服务端拒绝。
+
+**v1.3 的修法**：
+
+1. 新增 `isDecoy(el)`：命中 `.hidden-box` 祖先，或「无 id / 无 placeholder / 无 class / tabindex=-1」的一律视为诱饵；
+2. `findPswInput()` / `findUserInput()` **先排除诱饵**，再按 `id` → `placeholder` → 类型 依次匹配
+   （`id="password"` 重新回到最高优先级，与 v1.1 一致）；
+3. `injectCheckboxes()` 自愈：若发现 UI 已经挂进了 `.hidden-box`，自动摘掉重挂到真实表单上；
+4. 诊断新增 `boxVisible` / `boxInDecoy`，从托盘日志里一眼就能确认 UI 是否真的在屏幕上。
+
+**真实运行时验证**（本机重启客户端后）：
+
+```
+[23:26:05] module initialized (v1.3)
+[23:26:07] SPA route changed to #/login -> reactivating patch
+           probe: ver=1.3  pswId='password'  box=true  boxVisible=true  boxInDecoy=false
+```
+
+**回归测试**（`tools/test-renderer.js`，jsdom 仿真，DOM 顺序严格照抄门户）：
+
+| 脚本 | 诱饵块断言 | SPA 重绘断言 | 结果 |
+|---|---|---|---|
+| 原始 v1.1 | ✅ 8/8 | ❌ 3 项失败 | 24 passed, 3 failed |
+| v1.2（回归版） | ❌ UI 进诱饵块 | ❌ | 16 passed, 11 failed |
+| **v1.3** | ✅ | ✅ | **27 passed, 0 failed** |
 
 ### v1.2 修复记录（2026-10-27，现场问题：「自动注销后没有自动登录」）
 
@@ -484,7 +539,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -Action status
 [12:42:01.47] [Main] appStart
 [12:42:02.62] [aTrustRemember] renderer script injected
 [12:42:02.75] [aTrustRemember] DPAPI channel OK: F0_ffi_inproc op=unprotect
-[12:42:03.22] [aTrustRemember] credential restored into login page for user: <your-account> allowSubmit=true
+[12:42:03.22] [aTrustRemember] credential restored into login page for user: 王磊 allowSubmit=true
 [12:42:05.06] [aTrustRemember] auto goLogin: clicked
 [12:42:08.99] [portal] update user status to online          ← agent loginTime = 12:42:03
 ```
@@ -506,7 +561,7 @@ head=AQAAANCMnd8=  (DPAPI blob header)
 isDpapiBlob=true
 plaintextHits=[]
 decrypt=OK
-user=<your-account>
+user=王磊
 password(masked)=W*************$
 RESULT=OK
 ```
@@ -545,7 +600,6 @@ vendor 已删除、凭据已删除、备份保留，exit 0。
 ```
 aTrustRememberPatch\
 ├─ README.md                           本文档
-├─ LICENSE                             MIT 许可
 ├─ setup.ps1                           ★ 主入口：交互菜单（安装/卸载/状态），分级日志
 ├─ install.ps1                         兼容入口 → setup.ps1 -Action install
 ├─ uninstall.ps1                       兼容入口 → setup.ps1 -Action uninstall
@@ -558,7 +612,6 @@ aTrustRememberPatch\
 ├─ vendor\
 │  └─ node_modules\                    ffi-napi / ref-napi / ref-struct-di /
 │                                      node-gyp-build / debug / ms（MIT, N-API 预编译）
-│                                      每个包内附其 MIT LICENSE
 ├─ patch\
 │  ├─ atrust_remember.js               主进程模块（DPAPI 存取 + 注入 + 轮询 + 退出判据）
 │  ├─ atrust_remember_renderer.js      渲染进程脚本（勾选 UI + 捕获 + 回填 + 自动提交）
@@ -572,30 +625,3 @@ aTrustRememberPatch\
    ├─ dryrun.js / css-rules.js         门户样式与 DOM 取证
    └─ fix-bom.js                       PS 5.1 UTF-8 BOM 修正
 ```
-
-### 重建 vendor（可选）
-
-仓库已自带编译好的 `vendor\`，正常安装**不需要**这一步。
-只有想更新依赖版本时才需要重建：
-
-```powershell
-npm install --ignore-scripts --no-save ffi-napi@4.0.3 ref-napi@3.0.3 ref-struct-di@1.1.1 node-gyp-build@4.8.4 debug@4.4.3 ms@2.1.3
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build-vendor.ps1
-```
-
-`--ignore-scripts` 必须加：否则 npm 会尝试用 node-gyp 本地编译 ffi-napi，
-而本仓库依赖的是 tarball 内自带的 N-API 预编译二进制，不需要编译器。
-
----
-
-## 十、开源说明
-
-- 本仓库以 **MIT** 协议开源，见 [LICENSE](LICENSE)。
-- `vendor\node_modules\` 下的第三方包（ffi-napi / ref-napi / ref-struct-di /
-  node-gyp-build / debug / ms）均为 **MIT 许可**，各自目录内附原始 LICENSE。
-  `ffi-napi` 的预编译二进制内含 libffi，其许可一并附在
-  `vendor\node_modules\ffi-napi\LICENSE-libffi`。
-- 本仓库**不含**任何深信服（Sangfor）的二进制、代码或安装包，
-  也不包含任何真实凭据、账号或公司内网信息。
-- 项目作者与深信服无隶属关系；本仓库仅为个人自用的客户端补丁，
-  不代表官方立场。使用前请自行评估 §八 的合规风险。

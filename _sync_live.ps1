@@ -1,15 +1,12 @@
 ﻿<#
-  把当前补丁内容就地同步进另一个副本目录，保留目标目录下的 .git（便于看 diff），
-  但排除 .git 与运行期日志。
-  用法: powershell -File _sync_live.ps1 -Dst '<目标副本目录>' [-Src '<源目录，缺省为本脚本所在目录>']
+  把 v1.2 的内容就地同步进桌面上的活副本目录（默认 aTrustRememberPatch-v1.1），
+  保留该目录下的 .git（便于用户看 diff），但排除 .git 与运行期日志。
 #>
 param(
-    [string]$Src = '',
-    [string]$Dst = ''
+    [string]$Src = 'C:\Users\51962\.minimax\sessions\mvs_a5d5870b15864231a1e5aafebe44ca24\workspace\aTrustRememberPatch',
+    [string]$Dst = 'C:\Users\51962\Desktop\data\aTrustRememberPatch-v1.1'
 )
 $ErrorActionPreference = 'Stop'
-if ([string]::IsNullOrWhiteSpace($Src)) { $Src = $PSScriptRoot }
-if ([string]::IsNullOrWhiteSpace($Dst)) { throw "必须指定 -Dst（目标副本目录）" }
 if (-not (Test-Path $Src)) { throw "源目录不存在: $Src" }
 if (-not (Test-Path $Dst)) { throw "目标目录不存在: $Dst" }
 

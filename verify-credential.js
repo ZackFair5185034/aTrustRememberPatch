@@ -28,9 +28,9 @@ console.log("head=" + head + "  (DPAPI blob header expected: AQAAANCMnd8=)");
 const isDpapi = raw.slice(0, 8).toString("base64").indexOf("AQAAANCMnd8") === 0;
 console.log("isDpapiBlob=" + isDpapi);
 
-// 明文泄漏检查：凭据 JSON 的键名一旦出现在密文里，说明没加密
+// 明文泄漏检查
 const hits = [];
-for (const kw of ['"u":', '"p":', '"ts":']) {
+for (const kw of ["P@ss", "password", "王磊", "u\":", "p\":"]) {
   if (raw.indexOf(Buffer.from(kw, "utf8")) >= 0) hits.push(kw);
 }
 console.log("plaintextHits=" + JSON.stringify(hits));

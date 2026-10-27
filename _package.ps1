@@ -1,13 +1,12 @@
 ﻿<#
   aTrustRemember —— 打包 + 同步到桌面
-  用法: powershell -NoProfile -ExecutionPolicy Bypass -File _package.ps1 [-Version 1.2] [-Desktop '<目标目录>']
-  说明: 打包时排除 .git / *.log / install-output.log 等运行期产物；-Desktop 缺省为当前用户桌面
+  用法: powershell -NoProfile -ExecutionPolicy Bypass -File _package.ps1 [-Version 1.2] [-Desktop 'C:\Users\51962\Desktop\data']
+  说明: 打包时排除 .git / *.log / install-output.log 等运行期产物
 #>
 param(
     [string]$Version = '1.2',
-    [string]$Desktop = ''
+    [string]$Desktop = 'C:\Users\51962\Desktop\data'
 )
-if ([string]::IsNullOrWhiteSpace($Desktop)) { $Desktop = [Environment]::GetFolderPath('Desktop') }
 $ErrorActionPreference = 'Stop'
 
 $ws     = Split-Path -Parent $PSScriptRoot

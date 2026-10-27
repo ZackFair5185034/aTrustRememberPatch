@@ -23,11 +23,11 @@ if ([string]::IsNullOrWhiteSpace($OutRoot)) {
   $OutRoot = Join-Path $patchRoot 'vendor'
 }
 if ([string]::IsNullOrWhiteSpace($SourceNodeModules)) {
-  $SourceNodeModules = Join-Path $patchRoot 'node_modules'
+  $SourceNodeModules = Join-Path (Split-Path -Parent $patchRoot) '_nativetest\node_modules'
 }
 
 if (-not (Test-Path $SourceNodeModules)) {
-  throw "source node_modules not found: $SourceNodeModules`n先在补丁目录执行：`nnpm install --ignore-scripts --no-save ffi-napi@4.0.3 ref-napi@3.0.3 ref-struct-di@1.1.1 node-gyp-build@4.8.4 debug@4.4.3 ms@2.1.3`n（或用 -SourceNodeModules 指定已有的 node_modules 目录）"
+  throw "source node_modules not found: $SourceNodeModules"
 }
 
 $target = Join-Path $OutRoot 'node_modules'
@@ -35,14 +35,13 @@ if (Test-Path $target) { Remove-Item -Recurse -Force $target }
 New-Item -ItemType Directory -Path $target -Force | Out-Null
 
 # 包名 -> 需要保留的子项
-# LICENSE 必须一并保留（MIT 分发要求）；ms 的文件名是小写 license.md
 $plan = @(
-  @{ name = 'ffi-napi';      items = @('lib', 'package.json', 'prebuilds', 'LICENSE') },
-  @{ name = 'ref-napi';      items = @('lib', 'package.json', 'prebuilds', 'LICENSE') },
-  @{ name = 'ref-struct-di'; items = @('lib', 'package.json', 'LICENSE') },
-  @{ name = 'node-gyp-build';items = @('index.js', 'node-gyp-build.js', 'package.json', 'LICENSE') },
-  @{ name = 'debug';         items = @('src', 'package.json', 'LICENSE') },
-  @{ name = 'ms';            items = @('index.js', 'package.json', 'license.md') }
+  @{ name = 'ffi-napi';      items = @('lib', 'package.json', 'prebuilds') },
+  @{ name = 'ref-napi';      items = @('lib', 'package.json', 'prebuilds') },
+  @{ name = 'ref-struct-di'; items = @('lib', 'package.json') },
+  @{ name = 'node-gyp-build';items = @('index.js', 'node-gyp-build.js', 'package.json') },
+  @{ name = 'debug';         items = @('src', 'package.json') },
+  @{ name = 'ms';            items = @('index.js', 'package.json') }
 )
 
 foreach ($p in $plan) {
@@ -64,18 +63,6 @@ foreach ($p in $plan) {
     }
   }
   Write-Output "  packed: $($p.name)"
-}
-
-# ms 的许可文件名是小写 license.md，统一改名成 LICENSE
-$msLicense = Join-Path $target 'ms\license.md'
-if (Test-Path $msLicense) {
-  Move-Item -Force $msLicense (Join-Path $target 'ms\LICENSE')
-}
-
-# ffi-napi 的预编译二进制内含 libffi，一并带上它的许可
-$libffi = Join-Path $SourceNodeModules 'ffi-napi\deps\libffi\LICENSE'
-if (Test-Path $libffi) {
-  Copy-Item -Force $libffi (Join-Path $target 'ffi-napi\LICENSE-libffi')
 }
 
 # 自检：node-gyp-build 需要 prebuilds/<platform>-<arch> 这一层

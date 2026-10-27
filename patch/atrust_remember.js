@@ -37,7 +37,7 @@ const { execFile, execFileSync, spawn, spawnSync } = require("child_process");
 const Log = require("./util/logger");
 
 const LOG_TAG = "[aTrustRemember]";
-const PATCH_VERSION = "1.2";
+const PATCH_VERSION = "1.3";
 const DATA_DIR = path.join(process.env.APPDATA || os.homedir(), "aTrustRemember");
 const CRED_FILE = path.join(DATA_DIR, "credential.bin");
 const HELPER_FILE = path.join(__dirname, "atrust_remember_dpapi.js");

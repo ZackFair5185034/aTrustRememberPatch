@@ -2,12 +2,11 @@
 // 用文件而非 stdout 记录，以便捕获进程硬崩溃前的最后一步
 const { spawnSync, execFileSync, execFile } = require("child_process");
 const fs = require("fs");
-const path = require("path");
 const PS_ABS = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const CMD_ABS = "C:\\Windows\\System32\\cmd.exe";
 
 const name = process.argv[2];
-const log = process.argv[3] || path.join(__dirname, "diag-one.log");
+const log = process.argv[3] || "C:\\Users\\51962\\.minimax\\sessions\\mvs_a5d5870b15864231a1e5aafebe44ca24\\workspace\\aTrustRememberPatch\\diag-one.log";
 const out = (s) => { try { fs.appendFileSync(log, s + "\n"); } catch (e) {} };
 
 out("[" + name + "] begin pid=" + process.pid + " node=" + process.version);

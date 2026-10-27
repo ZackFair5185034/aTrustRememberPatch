@@ -35,7 +35,7 @@
  *       服务端的二次认证 / 设备风控 / 防重放策略全部照常生效。
  */
 (function () {
-  var VERSION = "1.2";
+  var VERSION = "1.3";
   var MASK = "♂♀☺♪♫◙♂♀"; // 原生"记住密码"使用的密码掩码
   var LS_USER = "atrustRememberUser";
   var LS_ENABLED = "atrustRememberEnabled";
@@ -196,6 +196,27 @@
         btnTxt: b ? String(b.textContent || "").trim().slice(0, 10) : null,
         captcha: hasCaptcha(),
         box: !!document.getElementById("atrust-remember-box"),
+        /* UI 是否真的挂在真实登录表单上、且用户看得见 */
+        boxVisible: (function () {
+          var b = document.getElementById("atrust-remember-box");
+          if (!b) return false;
+          try {
+            if (b.closest && b.closest(".hidden-box")) return false;
+            var p = b.parentElement;
+            if (!p || !p.querySelector("#password")) return false;
+            return !!(b.offsetParent || b.getClientRects().length);
+          } catch (e) {
+            return true;
+          }
+        })(),
+        boxInDecoy: (function () {
+          var b = document.getElementById("atrust-remember-box");
+          try {
+            return !!(b && b.closest && b.closest(".hidden-box"));
+          } catch (e) {
+            return false;
+          }
+        })(),
         boxStyle: (function () {
           var sq = document.querySelector("#atrust-remember-box .atrust-cb-box");
           if (!sq) return null;
@@ -245,25 +266,68 @@
     return String(v) === MASK;
   }
 
+  /* ------------------------------------------------------------------ *
+   * 门户登录页的「诱饵输入框」
+   * ------------------------------------------------------------------ *
+   * 门户登录组件（useInitHelp*.js）会在真实表单 **之前** 渲染一个诱饵块：
+   *   <div class="hidden-box">
+   *     <input type="text"     tabindex="-1">
+   *     <input type="password" tabindex="-1">     ← 诱饵密码框
+   *     <input type="hidden"   name="csrf-token" value="anti-code-scan">
+   *   </div>
+   * 这个块在页面上「看起来是隐藏的」，但它仍然参与布局，
+   * offsetParent / getClientRects 都可能返回真值 ——
+   * 所以「按可见性筛选」会选中这个诱饵框，
+   * 一旦把 UI 插到它旁边，用户就完全看不到「记住密码 / 掉线后自动登录」；
+   * 更糟的是密码会被写进诱饵框，真实密码框仍然是空的。
+   *
+   * 真实登录字段固定是：
+   *   .switch-login-slide > .auth-password > div
+   *     > .form-input-line.user-input > input#username (placeholder=请输入账号)
+   *     > .form-input-line.rel        > input#password (placeholder=请输入密码)
+   *
+   * 因此查找规则：**先排除诱饵块，再按 id → placeholder → 类型 依次匹配**。
+   */
+  function isDecoy(el) {
+    if (!el) return false;
+    try {
+      if (el.closest && el.closest(".hidden-box")) return true;
+    } catch (e) {}
+    // 没有 id / 没有 placeholder / 没有 class / tabindex=-1 —— 一律当诱饵处理
+    var noId = !el.id;
+    var noPh = !el.placeholder;
+    var noCls = !String(el.className || "").trim();
+    return noId && noPh && noCls && String(el.getAttribute("tabindex") || "") === "-1";
+  }
+
+  /* 密码框：id 优先（真实登录页），再 placeholder，最后才按类型 */
   function findPswInput() {
-    var byId = asInput(document.getElementById("password"));
     var inputs = allInputs();
-    var vis = inputs.filter(function (i) { return i.type === "password" && isVisible(i); })[0];
+    // ① 真实登录页密码框 id="password"
+    var byId = asInput(document.getElementById("password"));
+    if (byId && !isDecoy(byId)) return byId;
+    // ② placeholder 含「密码」
+    var byPh = inputs.filter(function (i) {
+      return !isDecoy(i) && (i.placeholder || "").indexOf("密码") >= 0;
+    })[0];
+    if (byPh) return byPh;
+    // ③ 可见的 type=password
+    var vis = inputs.filter(function (i) {
+      return !isDecoy(i) && i.type === "password" && isVisible(i);
+    })[0];
     if (vis) return vis;
-    if (byId) return byId;
-    return (
-      inputs.filter(function (i) { return i.value === MASK; })[0] ||
-      inputs.filter(function (i) { return (i.placeholder || "").indexOf("密码") >= 0 && isVisible(i); })[0] ||
-      null
-    );
+    // ④ 兜底：任意非诱饵的 password
+    var any = inputs.filter(function (i) { return !isDecoy(i) && i.type === "password"; })[0];
+    if (any) return any;
+    return null;
   }
 
   function findUserInput() {
     var byId = asInput(document.getElementById("username"));
-    if (byId) return byId;
+    if (byId && !isDecoy(byId)) return byId;
     var psw = findPswInput();
     var candidates = allInputs().filter(function (i) {
-      return i !== psw && i.type !== "checkbox" && i.type !== "radio" && i.type !== "hidden";
+      return i !== psw && !isDecoy(i) && i.type !== "checkbox" && i.type !== "radio" && i.type !== "hidden";
     });
     /* 优先在「可见」的输入框里找；万一一个都不可见（无布局引擎 / 元素被临时隐藏），
      * 退回全部候选，避免因为可见性判断失误而漏掉用户名框。 */
@@ -450,7 +514,19 @@
   }
 
   function injectCheckboxes() {
-    if (document.getElementById("atrust-remember-box")) return;
+    var existing = document.getElementById("atrust-remember-box");
+    if (existing) {
+      /* 已经挂载：只有当它被挂进了诱饵块（.hidden-box）——也就是用户完全看不到 ——
+       * 才摘掉重挂。其它情况一律保持原样，避免反复增删造成闪烁。 */
+      var inDecoy = false;
+      try {
+        inDecoy = !!(existing.closest && existing.closest(".hidden-box"));
+      } catch (e) {}
+      if (!inDecoy) return;
+      try {
+        existing.parentElement.removeChild(existing);
+      } catch (e) {}
+    }
     var psw = findPswInput();
     if (!psw) return;
     ensureStyle();

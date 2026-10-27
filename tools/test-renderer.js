@@ -40,16 +40,66 @@ function markVisible(el) {
 }
 
 /* ------------------------------------------------------------------ *
- * 仿真的门户登录页 DOM（按实测结构）
- * ------------------------------------------------------------------ */
+ * 仿真的门户登录页 DOM
+ * ------------------------------------------------------------------ *
+ * 结构严格照抄门户登录组件（resources\app\web\assets\useInitHelp*.js）：
+ *
+ *   <div class="hidden-box">              ← 诱饵块，在真实表单 **之前**
+ *     <input type="text"     tabindex="-1">
+ *     <input type="password" tabindex="-1">
+ *     <input type="hidden" name="csrf-token" value="anti-code-scan" tabindex="-1">
+ *   </div>
+ *   <div class="switch-login-slide">
+ *     <div class="auth-password">
+ *       <div>                              ← wrapper
+ *         <div class="form-input-line user-input">
+ *           <input class="ix-input-inner" placeholder="请输入账号">   ← 无 id
+ *         </div>
+ *         <div class="form-input-line rel">
+ *           <input id="password" type="password" class="ix-input-inner" placeholder="请输入密码">
+ *         </div>
+ *       </div>
+ *       <div class="login-btn auto-click-login include-box__button mb16">…</div>
+ *     </div>
+ *   </div>
+ *
+ * 诱饵 password 框在页面上「看起来是隐藏的」，但仍参与布局，
+ * 因此 isVisible() 会返回 true —— v1.2 初版正是因此把 UI 插进了诱饵块，
+ * 导致用户看不到「记住密码 / 掉线后自动登录」。
+ */
 function buildLoginDom(dom, opts) {
   const o = opts || {};
   const doc = dom.window.document;
   doc.body.innerHTML = "";
+
+  // ---- 诱饵块（必须在真实表单之前） ----
+  const decoy = doc.createElement("div");
+  decoy.className = "hidden-box";
+  const dText = doc.createElement("input");
+  dText.type = "text";
+  dText.setAttribute("tabindex", "-1");
+  const dPsw = doc.createElement("input");
+  dPsw.type = "password";
+  dPsw.setAttribute("tabindex", "-1");
+  const dCsrf = doc.createElement("input");
+  dCsrf.type = "hidden";
+  dCsrf.name = "csrf-token";
+  dCsrf.value = "anti-code-scan";
+  dCsrf.setAttribute("tabindex", "-1");
+  decoy.appendChild(dText);
+  decoy.appendChild(dPsw);
+  decoy.appendChild(dCsrf);
+  doc.body.appendChild(decoy);
+  // 诱饵框仍然「有布局」（真实页面就是这样），所以标记为可见
+  markVisible(dText);
+  markVisible(dPsw);
+
+  // ---- 真实登录表单 ----
   const wrap = doc.createElement("div");
   wrap.className = "switch-login-slide";
   const auth = doc.createElement("div");
   auth.className = "auth-password";
+  const wrapper = doc.createElement("div");
   const userLine = doc.createElement("div");
   userLine.className = "form-input-line user-input";
   const user = doc.createElement("input");
@@ -66,33 +116,30 @@ function buildLoginDom(dom, opts) {
   psw.setAttribute("placeholder", "请输入密码");
   markVisible(psw);
   rel.appendChild(psw);
-  const hidden = doc.createElement("div");
-  hidden.className = "hidden-box";
-  const csrf = doc.createElement("input");
-  csrf.name = "csrf-token";
-  csrf.type = "hidden";
-  hidden.appendChild(csrf);
-  const btn = doc.createElement("button");
-  btn.className = "ix-button ix-button-block ix-button-primary";
-  btn.textContent = "登录";
+  wrapper.appendChild(userLine);
+  wrapper.appendChild(rel);
+  const btn = doc.createElement("div");
+  btn.className = "login-btn auto-click-login include-box__button mb16";
+  btn.appendChild(doc.createElement("button"));
+  btn.querySelector("button").className = "ix-button ix-button-block ix-button-primary";
+  btn.querySelector("button").textContent = "登录";
   markVisible(btn);
-  btn.addEventListener("click", function () {
+  btn.querySelector("button").addEventListener("click", function () {
     const n = parseInt(wrap.getAttribute("data-clicked") || "0", 10) || 0;
     wrap.setAttribute("data-clicked", String(n + 1));
   });
-  auth.appendChild(userLine);
-  auth.appendChild(rel);
-  auth.appendChild(hidden);
+  auth.appendChild(wrapper);
   auth.appendChild(btn);
   wrap.appendChild(auth);
   doc.body.appendChild(wrap);
+
   if (o.captcha) {
     const cap = doc.createElement("input");
     cap.setAttribute("placeholder", "请输入验证码");
     markVisible(cap);
     auth.appendChild(cap);
   }
-  return { wrap: wrap, user: user, psw: psw, btn: btn, auth: auth };
+  return { wrap: wrap, user: user, psw: psw, btn: btn, auth: auth, decoy: decoy, dPsw: dPsw, dText: dText };
 }
 
 function newWindow() {
@@ -106,7 +153,7 @@ function newWindow() {
   const win = dom.window;
   win.localStorage.setItem("atrustRememberEnabled", "1");
   win.localStorage.setItem("atrustRememberAutoLogin", "1");
-  win.localStorage.setItem("atrustRememberUser", "testuser");
+  win.localStorage.setItem("atrustRememberUser", "王磊");
   return dom;
 }
 
@@ -133,12 +180,18 @@ async function main() {
     const dom = newWindow();
     const form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
-    check("密码框已回填", form.psw.value === "test-pass-123", form.psw.value);
-    check("用户名框已回填", form.user.value === "testuser", form.user.value);
+    check("密码框已回填", form.psw.value === "P@ssw0rd!", form.psw.value);
+    check("用户名框已回填", form.user.value === "王磊", form.user.value);
     check("登录按钮被点击（自动提交）", form.wrap.getAttribute("data-clicked") === "1", form.wrap.getAttribute("data-clicked"));
     check("复选框已渲染", !!dom.window.document.getElementById("atrust-remember-box"));
+    // ★ 诱饵块断言（v1.2 初版回归点）
+    const box = dom.window.document.getElementById("atrust-remember-box");
+    check("★ UI 没有被插进诱饵块 .hidden-box", !!(box && !(box.closest && box.closest(".hidden-box"))));
+    check("★ UI 与真实密码框同容器", !!(box && box.parentElement && box.parentElement.querySelector("#password")));
+    check("★ 诱饵密码框没有被写入", form.dPsw.value === "", JSON.stringify(form.dPsw.value));
+    check("★ 诱饵文本框没有被写入", form.dText.value === "", JSON.stringify(form.dText.value));
     dom.window.close();
   }
 
@@ -149,17 +202,17 @@ async function main() {
     const dom = newWindow();
     let form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
     check("第一轮：已回填并提交", form.wrap.getAttribute("data-clicked") === "1");
-    check("第一轮：密码框有值", form.psw.value === "test-pass-123");
+    check("第一轮：密码框有值", form.psw.value === "P@ssw0rd!");
 
     // 门户重绘：整个表单换一批新的 DOM 元素（新的 password 输入框，值为空）
     form = buildLoginDom(dom);
     check("重绘后密码框确实是新元素且为空", form.psw.value === "");
     await sleep(1600);
-    check("★ 重绘后密码框被自动重新回填", form.psw.value === "test-pass-123", "value=" + JSON.stringify(form.psw.value));
-    check("★ 重绘后用户名框被自动重新回填", form.user.value === "testuser", form.user.value);
+    check("★ 重绘后密码框被自动重新回填", form.psw.value === "P@ssw0rd!", "value=" + JSON.stringify(form.psw.value));
+    check("★ 重绘后用户名框被自动重新回填", form.user.value === "王磊", form.user.value);
     check("重绘后未立刻重复提交（20 秒冷却保护）", form.wrap.getAttribute("data-clicked") === null, form.wrap.getAttribute("data-clicked"));
     dom.window.close();
   }
@@ -191,12 +244,12 @@ async function main() {
     const dom = newWindow();
     const form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
-    check("先回填成功", form.psw.value === "test-pass-123", form.psw.value);
+    check("先回填成功", form.psw.value === "P@ssw0rd!", form.psw.value);
     form.psw.value = ""; // 外部/门户把密码框清空了
     await sleep(1600);
-    check("★ 密码框被清空后被自动补回", form.psw.value === "test-pass-123", "value=" + JSON.stringify(form.psw.value));
+    check("★ 密码框被清空后被自动补回", form.psw.value === "P@ssw0rd!", "value=" + JSON.stringify(form.psw.value));
     dom.window.close();
   }
 
@@ -207,9 +260,9 @@ async function main() {
     const dom = newWindow();
     const form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: false });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: false });
     await sleep(1400);
-    check("密码框已回填", form.psw.value === "test-pass-123", form.psw.value);
+    check("密码框已回填", form.psw.value === "P@ssw0rd!", form.psw.value);
     check("登录按钮未被点击", form.wrap.getAttribute("data-clicked") === null, form.wrap.getAttribute("data-clicked"));
     dom.window.close();
   }
@@ -221,7 +274,7 @@ async function main() {
     const dom = newWindow();
     let form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
     // 用户在重绘后的表单里自己敲了密码
     form = buildLoginDom(dom);
@@ -239,9 +292,9 @@ async function main() {
     const dom = newWindow();
     const form = buildLoginDom(dom, { captcha: true });
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
-    check("密码框已回填", form.psw.value === "test-pass-123", form.psw.value);
+    check("密码框已回填", form.psw.value === "P@ssw0rd!", form.psw.value);
     check("有验证码时未自动提交", form.wrap.getAttribute("data-clicked") === null, form.wrap.getAttribute("data-clicked"));
     dom.window.close();
   }
@@ -253,11 +306,11 @@ async function main() {
     const dom = newWindow();
     const form = buildLoginDom(dom);
     const api = injectRenderer(dom);
-    api.restore({ u: "testuser", p: "test-pass-123", allowSubmit: true });
+    api.restore({ u: "王磊", p: "P@ssw0rd!", allowSubmit: true });
     await sleep(1400);
     const api2 = injectRenderer(dom);
     check("重复注入返回同一个实例", api2 === api);
-    check("重复注入不破坏已回填的值", form.psw.value === "test-pass-123", form.psw.value);
+    check("重复注入不破坏已回填的值", form.psw.value === "P@ssw0rd!", form.psw.value);
     dom.window.close();
   }
 
