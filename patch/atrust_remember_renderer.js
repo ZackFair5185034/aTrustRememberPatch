@@ -1,40 +1,92 @@
 /**
- * aTrustRemember —— 渲染进程注入脚本
+ * aTrustRemember —— 渲染进程注入脚本 (v1.2)
  *
  * 由主进程通过 webContents.executeJavaScript 注入到门户登录页所在的渲染进程。
  *
- * 实测的登录页 DOM 结构（aTrust 门户 SPA, useInitHelp*.js 模板）：
- *   div.switch-login-slide > div.auth-password
- *     > div.form-input-line.user-input  →  input#username   (placeholder: 请输入您的用户名)
- *     > div.form-input-line.rel         →  input#password   (placeholder: 请输入密码)
- *     > 登录按钮 = input[type=submit] / button，文本 "登录"
+ * ──────────────────────────────────────────────────────────────────────────
+ * v1.2 修复：解决「自动注销（掉线）后没有自动登录」的现场缺陷
+ * ──────────────────────────────────────────────────────────────────────────
+ * 缺陷 A（致命）：v1.1 用一个布尔量 state.applied 记录「已经回填过了」。
+ *   门户是 SPA，掉线后会**重绘**登录表单（生成一个新的 password 输入框元素），
+ *   而 state.applied 会一直保持 true，于是：
+ *     - tick() 里的 `restoreReq && !state.applied` 不再成立 → 不再回填；
+ *     - peek() 里的 `!state.applied && findPswInput()` 不再成立 → 不再向主进程索要凭据。
+ *   结果：主进程即使把凭据推过去，渲染进程也认为「已经填过了」而直接跳过，
+ *         密码框保持空白，也没有任何自动提交 —— 这就是用户看到的现象。
  *
- * 职责:
- *   1. 在密码行下方插入「记住密码」「掉线后自动登录」两个开关（localStorage 记忆）。
- *   2. 监听 #password 的输入，捕获明文密码（仅驻留内存）。
- *   3. 拦截 POST /passport/v1/auth/psw 的响应：
- *      成功 → 把凭据交给主进程用 DPAPI 加密保存；
- *      失败 → 通知主进程丢弃本地凭据，避免反复重试导致账号锁定。
- *   4. 主进程 restore() 时回填用户名/密码，并按开关自动提交登录。
+ * 缺陷 B：主进程只监听 did-finish-load / did-navigate，
+ *   而门户用 **hash 路由** 在同一个文档内跳转（#/app_center → #/login），
+ *   这种跳转只会触发 did-navigate-in-page，
+ *   于是掉线回到登录页时主窗口既不会被重新激活、凭据也不会推给主窗口。
+ *
+ * v1.2 的做法：
+ *   1) 「是否已回填」不再用布尔量，而是按 **密码框元素身份 + 当前值** 判断：
+ *      只有当密码框为空（或为原生掩码 MASK）时才回填。
+ *      → 表单被重绘（元素变了、值为空）→ 自动重新回填；
+ *      → 用户自己敲了密码（值非空）→ 不覆盖、也不自动提交。
+ *   2) peek() 的 needRestore 不再受 applied 约束：
+ *      只要看到「密码框存在且值为空」，就向主进程索要凭据（4 秒节流）。
+ *      → 凭据的 allowSubmit 也会随之刷新（主动退出时为 false，掉线时为 true）。
+ *   3) 提交条件收紧：只提交「我们自己回填进去的那份密码」；
+ *      同一表单元素只提交一次 + 全局 20 秒冷却 + 每轮最多 3 次（防止账号被锁）。
+ *   4) 新增 revive()：SPA 路由变化时由主进程调用，解除粘滞状态并立即重试回填。
  *
  * 说明: 这里的自动提交是「重新走一次正常的账号密码登录」，
  *       服务端的二次认证 / 设备风控 / 防重放策略全部照常生效。
  */
 (function () {
-  if (window.__atrustRemember) return;
-
+  var VERSION = "1.2";
   var MASK = "♂♀☺♪♫◙♂♀"; // 原生"记住密码"使用的密码掩码
   var LS_USER = "atrustRememberUser";
   var LS_ENABLED = "atrustRememberEnabled";
   var LS_AUTO = "atrustRememberAutoLogin";
 
-  var state = { pending: null, fail: false, clear: false, restoreReq: null, applied: false, autoSubmitTried: false, sawLoginForm: false, lastUser: "", allowSubmit: false };
+  var ASK_COOLDOWN_MS = 4000; // 向主进程索要凭据的最小间隔
+  var SUBMIT_COOLDOWN_MS = 20000; // 两次自动提交之间的最小间隔
+  var MAX_SUBMIT_PER_CYCLE = 3; // 一轮登录周期内最多自动提交几次（防账号锁定）
+
+  var state = {
+    pending: null, // 待交给主进程保存的凭据 { u, p }
+    fail: false, // 服务端拒绝了凭据
+    clear: false, // 用户取消了「记住密码」
+    restoreReq: null, // 主进程下发的凭据 { u, p, allowSubmit }
+    appliedEl: null, // 我们回填过的密码框（按元素身份判断，表单重绘后自然失效）
+    appliedVal: "", // 我们放进去的密码（用于确认「当前值仍是我们填的」）
+    submitEl: null, // 已经自动提交过的表单元素
+    submitCount: 0, // 本轮已自动提交次数
+    lastSubmitAt: 0, // 上次自动提交的时间戳
+    askRestoreAt: 0, // 上次索要凭据的时间戳
+    reviveCount: 0, // 被主进程唤醒的次数
+    sawLoginForm: false,
+    lastUser: ""
+  };
   var lastTyped = "";
-  var retryCount = 0;
-  var MAX_RETRY = 40;
+  var legacyPending = null;
+
+  /* ------------------------------------------------------------------ *
+   * 注入幂等处理
+   * ------------------------------------------------------------------ */
+  if (window.__atrustRemember) {
+    var old = window.__atrustRemember;
+    if (old.__v === VERSION) {
+      // 同一版本重复注入：只唤醒，不再重复安装事件监听
+      try {
+        old.revive();
+      } catch (e) {}
+      return;
+    }
+    // 旧版本实例：尽量把它已经捕获到的待存凭据接过来，避免漏存密码
+    try {
+      var r = old.peek ? old.peek() : null;
+      if (r && r.u && r.p) legacyPending = { u: r.u, p: r.p };
+    } catch (e) {}
+  }
 
   /* ---------------- API（主进程调用） ---------------- */
   window.__atrustRemember = {
+    __v: VERSION,
+
+    /* 主进程每 1.5 秒轮询一次 */
     peek: function () {
       if (state.clear) {
         state.clear = false;
@@ -45,13 +97,18 @@
         return { fail: true };
       }
       var out = null;
-      // 主动拉取：门户用 hash 路由跳到登录页时不会触发 did-finish-load，
-      // 主进程推不到凭据；这里检测到登录框就向主进程请求回填。
+      /* 主动索要凭据：
+       * 门户用 hash 路由跳到登录页时不会触发 did-finish-load，主进程推不到凭据；
+       * 这里只要看到「密码框存在且值为空」就向主进程要一次。
+       * 注意：这里 **不再** 受 state.applied 约束（v1.2 的核心修复）。 */
       try {
-        var now = new Date().getTime();
-        if (!state.applied && findPswInput() && now - (state.askRestoreAt || 0) > 4000) {
-          state.askRestoreAt = now;
-          out = { needRestore: true };
+        var pEl = findPswInput();
+        if (pEl && isEmptyPsw(pEl)) {
+          var now = new Date().getTime();
+          if (now - (state.askRestoreAt || 0) > ASK_COOLDOWN_MS) {
+            state.askRestoreAt = now;
+            out = { needRestore: true };
+          }
         }
       } catch (e) {}
       if (state.pending) {
@@ -61,27 +118,32 @@
       }
       return out;
     },
+
     clearPending: function () {
       state.pending = null;
     },
+
+    /* 主进程下发凭据 */
     restore: function (c) {
-      if (c && c.u) {
-        state.restoreReq = { u: c.u, p: c.p };
-        state.applied = false;
-        state.autoSubmitTried = false;
-        // 只有主进程明确允许时才自动提交（用户主动退出登录时禁止自动登录）
-        state.allowSubmit = c.allowSubmit === true;
-        retryCount = 0;
-        applyCredential(c.u, c.p);
-      }
+      if (!c || !c.u) return "no-credential";
+      state.restoreReq = { u: c.u, p: c.p, allowSubmit: c.allowSubmit === true };
+      // 刚收到凭据，短时间内不要重复索要
+      state.askRestoreAt = new Date().getTime();
+      applyCredential();
+      return "ok";
     },
+
     /* 服务端拒绝凭据后取消本地自动重试，避免反复尝试导致账号锁定 */
     cancelRestore: function () {
       state.restoreReq = null;
-      state.applied = false;
-      state.autoSubmitTried = false;
+      state.appliedEl = null;
+      state.appliedVal = "";
+      state.submitEl = null;
+      state.submitCount = 0;
       state.pending = null;
+      return "cancelled";
     },
+
     /* 掉线后自动进入登录页（仅在用户勾选了「掉线后自动登录」时生效） */
     autoGoLogin: function () {
       try {
@@ -96,18 +158,38 @@
         return "err:" + e.message;
       }
     },
+
+    /* SPA 路由变化后由主进程唤醒：解除粘滞状态，立即重试回填 */
+    revive: function () {
+      state.reviveCount++;
+      state.appliedEl = null;
+      state.appliedVal = "";
+      state.askRestoreAt = 0;
+      state.submitEl = null;
+      applyCredential();
+      return "revived";
+    },
+
     /* 自检接口: 供主进程探针调用 */
     diag: function () {
       var u = findUserInput();
       var p = findPswInput();
       var b = findLoginButton();
       return {
+        ver: VERSION,
         userFound: !!u,
         userPh: u ? String(u.placeholder || "") : null,
         userVal: u ? String(u.value || "") : null,
         pswFound: !!p,
         pswId: p ? p.id : null,
         pswType: p ? p.type : null,
+        pswEmpty: p ? isEmptyPsw(p) : null,
+        hasRestoreReq: !!state.restoreReq,
+        restoreAllow: state.restoreReq ? state.restoreReq.allowSubmit === true : null,
+        appliedHere: !!(p && state.appliedEl === p),
+        appliedValHere: !!(p && state.appliedVal && p.value === state.appliedVal),
+        submitCount: state.submitCount,
+        reviveCount: state.reviveCount,
         btnFound: !!b,
         btnTag: b ? b.tagName : null,
         btnCls: b ? String(b.className || "").slice(0, 60) : null,
@@ -155,12 +237,21 @@
     }
   }
 
+  /* 密码框当前是否「空」——空 或者 只剩原生掩码 */
+  function isEmptyPsw(el) {
+    if (!el) return true;
+    var v = el.value;
+    if (v === undefined || v === null || v === "") return true;
+    return String(v) === MASK;
+  }
+
   function findPswInput() {
     var byId = asInput(document.getElementById("password"));
-    if (byId) return byId;
     var inputs = allInputs();
+    var vis = inputs.filter(function (i) { return i.type === "password" && isVisible(i); })[0];
+    if (vis) return vis;
+    if (byId) return byId;
     return (
-      inputs.filter(function (i) { return i.type === "password" && isVisible(i); })[0] ||
       inputs.filter(function (i) { return i.value === MASK; })[0] ||
       inputs.filter(function (i) { return (i.placeholder || "").indexOf("密码") >= 0 && isVisible(i); })[0] ||
       null
@@ -171,16 +262,20 @@
     var byId = asInput(document.getElementById("username"));
     if (byId) return byId;
     var psw = findPswInput();
-    var inputs = allInputs().filter(function (i) {
-      return i !== psw && i.type !== "checkbox" && i.type !== "radio" && i.type !== "hidden" && isVisible(i);
+    var candidates = allInputs().filter(function (i) {
+      return i !== psw && i.type !== "checkbox" && i.type !== "radio" && i.type !== "hidden";
     });
+    /* 优先在「可见」的输入框里找；万一一个都不可见（无布局引擎 / 元素被临时隐藏），
+     * 退回全部候选，避免因为可见性判断失误而漏掉用户名框。 */
+    var visible = candidates.filter(isVisible);
+    var pool = visible.length ? visible : candidates;
     return (
       // 实测登录页用户名框: input.ix-input-inner[placeholder="请输入账号"]（无 id）
-      inputs.filter(function (i) {
+      pool.filter(function (i) {
         var p = i.placeholder || "";
         return p.indexOf("账号") >= 0 || p.indexOf("用户名") >= 0;
       })[0] ||
-      inputs.filter(function (i) { return i.type === "text" || !i.type; })[0] ||
+      pool.filter(function (i) { return i.type === "text" || !i.type; })[0] ||
       null
     );
   }
@@ -407,71 +502,103 @@
     else host.appendChild(box);
   }
 
-  /* ---------------- 回填 + 自动提交 ---------------- */
-  function applyCredential(u, p) {
-    if (!state.restoreReq) return;
-    if (state.applied) return;
-    if (retryCount > MAX_RETRY) return;
-    retryCount++;
-    setTimeout(function () {
+  /* ---------------- 回填 + 自动提交（v1.2 核心） ---------------- */
+  function applyCredential() {
+    var req = state.restoreReq;
+    if (!req) return "no-req";
+
+    var pEl = findPswInput();
+    if (!pEl) return "no-form"; // 表单还没渲染，等下一次 tick 再来
+
+    /* 填充实则：
+     *   - 密码框为空 / 只有原生掩码 → 说明需要（重新）回填；
+     *   - 密码框里已经有内容（多半是用户自己敲的）→ 不动它。
+     * 表单被 SPA 重绘后，新元素的值是空的 → 会自动重新回填，
+     * 这正是 v1.1 漏掉的那一步。 */
+    if (!isEmptyPsw(pEl)) {
+      // 值不是空的：如果是我们自己填的就继续走提交流程，否则不碰
+      if (!(state.appliedEl === pEl && state.appliedVal && pEl.value === state.appliedVal)) {
+        return "user-filled";
+      }
+    } else {
       var uEl = findUserInput();
-      var pEl = findPswInput();
-      if (!uEl || !pEl) {
-        applyCredential(u, p);
+      if (uEl && req.u) {
+        setValue(uEl, req.u);
+        state.lastUser = req.u;
+      }
+      if (req.p) {
+        setValue(pEl, req.p);
+        lastTyped = req.p;
+      }
+      state.appliedEl = pEl;
+      state.appliedVal = req.p || "";
+    }
+
+    /* 提交：只提交「我们自己回填进去的那份密码」 */
+    if (state.appliedEl !== pEl) return "not-ours";
+    if (!state.appliedVal || pEl.value !== state.appliedVal) return "value-changed";
+    if (state.submitEl === pEl) return "already-submitted"; // 同一个表单只提交一次
+    if (!req.allowSubmit) return "submit-not-allowed"; // 用户主动退出登录时不自动提交
+    if (localStorage.getItem(LS_AUTO) !== "1") return "auto-off";
+    if (hasCaptcha()) return "captcha"; // 有图形验证码就交给人工
+    if (state.submitCount >= MAX_SUBMIT_PER_CYCLE) return "submit-limit";
+    var now = new Date().getTime();
+    if (now - (state.lastSubmitAt || 0) < SUBMIT_COOLDOWN_MS) return "submit-cooldown";
+
+    state.submitEl = pEl;
+    state.submitCount++;
+    state.lastSubmitAt = now;
+    setTimeout(function () {
+      var btn = findLoginButton();
+      if (btn) {
+        btn.click();
         return;
       }
-      retryCount = 0;
-      state.applied = true;
-      if (u) {
-        setValue(uEl, u);
-        state.lastUser = u;
+      var pswEl = findPswInput();
+      if (pswEl) {
+        pswEl.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Enter",
+            code: "Enter",
+            keyCode: 13,
+            which: 13,
+            bubbles: true
+          })
+        );
       }
-      if (p) {
-        setValue(pEl, p);
-        lastTyped = p;
-      }
-      if (localStorage.getItem(LS_AUTO) !== "1") return;
-      if (state.allowSubmit !== true) return; // 用户主动退出登录时不自动提交
-      if (hasCaptcha()) return; // 有图形验证码就交给人工
-      if (state.autoSubmitTried) return; // 同一个页面只自动提交一次
-      state.autoSubmitTried = true;
-      setTimeout(function () {
-        var btn = findLoginButton();
-        if (btn) {
-          btn.click();
-          return;
-        }
-        var pswEl = findPswInput();
-        if (pswEl) {
-          pswEl.dispatchEvent(
-            new KeyboardEvent("keydown", {
-              key: "Enter",
-              code: "Enter",
-              keyCode: 13,
-              which: 13,
-              bubbles: true
-            })
-          );
-        }
-      }, 900);
-    }, 350);
+    }, 900);
+    return "submitted";
   }
 
   /* ---------------- 观察 DOM，等待登录框渲染 ---------------- */
   function tick() {
     injectCheckboxes();
-    // 登录框可能比主进程首次回填更晚渲染，这里持续重试直到成功
-    if (state.restoreReq && !state.applied) {
-      applyCredential(state.restoreReq.u, state.restoreReq.p);
+
+    var pEl = findPswInput();
+    if (!pEl) {
+      /* 登录框从 DOM 消失 → 登录页已离开（登录成功或跳走）
+       * 结束本轮登录周期，允许下一轮重新提交。 */
+      if (state.appliedEl) {
+        state.appliedEl = null;
+        state.appliedVal = "";
+        state.submitEl = null;
+        state.submitCount = 0;
+      }
+    } else {
+      state.sawLoginForm = true;
+      /* 自愈：只要有凭据且密码框是空的，就（重新）回填。
+       * 表单重绘 → 元素变了、值为空 → 这里会自动补上。 */
+      if (state.restoreReq) applyCredential();
     }
+
     // 兜底：登录成功后登录框从 DOM 消失（门户可能用 fetch 提交，拦截不到）。
     // 只有「确实见过登录框 + 用户手打过密码 + 现在登录框没了」才落凭据。
     var uNow = findUserInput();
     if (uNow && uNow.value) state.lastUser = uNow.value.trim();
-    if (findPswInput()) {
-      state.sawLoginForm = true;
-    } else if (lastTyped && state.sawLoginForm && !state.pending) {
-      stageCredential();
+    if (!findPswInput()) {
+      if (lastTyped && state.sawLoginForm && !state.pending) {
+        stageCredential();
+      }
     }
   }
 
@@ -491,4 +618,9 @@
   }
   setInterval(tick, 1000);
   document.addEventListener("DOMContentLoaded", tick);
+
+  /* 接管旧版本实例时，把它已经捕获的待存凭据补交上去 */
+  if (legacyPending) {
+    state.pending = legacyPending;
+  }
 })();

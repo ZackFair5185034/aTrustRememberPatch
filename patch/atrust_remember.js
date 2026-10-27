@@ -37,6 +37,7 @@ const { execFile, execFileSync, spawn, spawnSync } = require("child_process");
 const Log = require("./util/logger");
 
 const LOG_TAG = "[aTrustRemember]";
+const PATCH_VERSION = "1.2";
 const DATA_DIR = path.join(process.env.APPDATA || os.homedir(), "aTrustRemember");
 const CRED_FILE = path.join(DATA_DIR, "credential.bin");
 const HELPER_FILE = path.join(__dirname, "atrust_remember_dpapi.js");
@@ -59,7 +60,9 @@ let dpapiBroken = false; // 所有 DPAPI 通道均不可用
 let dpapiRunner = -1; // 已验证可用的通道下标，-1 = 尚未确定
 let explicitLogout = false; // 用户主动退出登录 → 抑制自动登录
 let explicitLogoutAt = 0; // 抑制生效时间（用于规避状态滞后竞态）
+let lastStatus = ""; // 上一次看到的会话状态（用于检测掉线）
 const pollTimers = new Map();
+const hookedWindows = new Set(); // 已挂钩的窗口（掉线时用来点「前往登录」）
 
 /* 托盘配置（用于读取会话状态）；拿不到就降级，不影响主流程 */
 let AppConfig = null;
@@ -93,6 +96,10 @@ function markExplicitLogout() {
  * 注意竞态：退出请求刚发出时，agent 上报的 status 可能还停留在 "online"，
  * 此时不能据此解除抑制，否则会把用户刚退出的会话又自动登回去。
  * 因此要求「距退出请求至少 8 秒」且状态确实变为 online 才解除。
+ *
+ * 另外检测「online → 非 online」的状态迁移：会话被服务端踢掉 / 网络掉线时，
+ * 门户面板上会出现「前往登录」按钮，这里自动点掉它，
+ * 让主窗口切到登录页（随后由 did-navigate-in-page 触发回填 + 自动提交）。
  */
 function syncSessionState() {
   if (!AppConfig || typeof AppConfig.getLoginStatus !== "function") return;
@@ -101,6 +108,14 @@ function syncSessionState() {
     st = String(AppConfig.getLoginStatus() || "");
   } catch (e) {
     return;
+  }
+  if (st !== lastStatus) {
+    const prev = lastStatus;
+    lastStatus = st;
+    if (prev === "online" && st && st !== "online") {
+      Log.info(LOG_TAG, "session dropped: " + prev + " -> " + st);
+      setTimeout(notifySessionDrop, 800);
+    }
   }
   if (st === "online" && explicitLogout && Date.now() - explicitLogoutAt > 8000) {
     explicitLogout = false;
@@ -630,20 +645,31 @@ const PROBE = `(function(){
 
 function probe(win, attempt) {
   const wc = win.webContents;
-  if (wc.isDestroyed()) return;
+  if (!wc || wc.isDestroyed()) return;
+  /* 每个窗口只允许一条探测链在跑，避免多条链并行刷日志 */
+  if (!attempt) {
+    if (wc.__atrustProbing) return;
+    wc.__atrustProbing = true;
+  }
   wc.executeJavaScript(PROBE)
     .then((r) => {
-      if (r !== probe._last) {
-        probe._last = r;
+      if (r !== wc.__atrustProbeLast) {
+        wc.__atrustProbeLast = r;
         Log.info(LOG_TAG, "probe#" + (attempt || 0) + ": " + r);
       }
       try {
         var o = JSON.parse(r);
-        if (o.box) return; // 已挂载成功，无需继续探测
+        if (o.box) {
+          wc.__atrustProbing = false;
+          return; // 已挂载成功，无需继续探测
+        }
       } catch (e) {}
       if ((attempt || 0) < 60) setTimeout(() => probe(win, (attempt || 0) + 1), 1500);
+      else wc.__atrustProbing = false;
     })
-    .catch(() => {});
+    .catch(() => {
+      wc.__atrustProbing = false;
+    });
 }
 
 /* 诊断开关: %APPDATA%\aTrustRemember\diag.json  { "gotoLogin": true } */
@@ -688,7 +714,7 @@ function autoGoLogin(win) {
     return;
   }
   const wc = win.webContents;
-  if (wc.isDestroyed()) return;
+  if (!wc || wc.isDestroyed()) return;
   wc.executeJavaScript(
     "(window.__atrustRemember && window.__atrustRemember.autoGoLogin) ? window.__atrustRemember.autoGoLogin() : null"
   )
@@ -696,37 +722,98 @@ function autoGoLogin(win) {
     .catch(() => {});
 }
 
+/* 会话掉线时：对所有窗口尝试点掉面板上的「前往登录」按钮。
+ * 主窗口随后会跳到 #/login，由 did-navigate-in-page 触发回填 + 自动提交。 */
+function notifySessionDrop() {
+  hookedWindows.forEach((win) => {
+    try {
+      if (!win || win.isDestroyed()) {
+        hookedWindows.delete(win);
+        return;
+      }
+      autoGoLogin(win);
+    } catch (e) {}
+  });
+}
+
+/**
+ * 窗口类型判定。
+ * 实测（本机日志）：
+ *   主窗口   = web/index.html?...  → 门户 SPA，登录表单在这里渲染
+ *   面板窗口 = web/tray.html?page=panel  → 只有「前往登录」按钮，没有登录表单
+ *   通知窗口 = web/tray.html?page=message
+ * 凭据只应该下发给门户窗口，避免明文密码出现在无关窗口的 JS 上下文里。
+ */
+function windowKind(wc) {
+  let u = "";
+  try {
+    u = String(wc.getURL() || "");
+  } catch (e) {}
+  if (!u) return "unknown";
+  if (/\/web\/index\.html/i.test(u)) return "portal";
+  if (/\/web\/tray\.html/i.test(u)) return "tray";
+  return "other";
+}
+
 async function restoreTo(win) {
   try {
+    const wc = win.webContents;
+    if (!wc || wc.isDestroyed()) return;
+    const kind = windowKind(wc);
+    if (kind === "tray") {
+      Log.info(LOG_TAG, "restore skipped: not portal window (" + kind + ")");
+      return;
+    }
     const allowSubmit = autoLoginAllowed();
     const cred = await ensureCredential();
     if (!cred) return;
-    const wc = win.webContents;
     if (wc.isDestroyed()) return;
     const payload = JSON.stringify({ u: cred.u, p: cred.p, allowSubmit: allowSubmit });
-    await wc.executeJavaScript("window.__atrustRemember && window.__atrustRemember.restore(" + payload + ")");
-    Log.info(LOG_TAG, "credential restored into login page for user: " + cred.u + " allowSubmit=" + allowSubmit);
+    const r = await wc.executeJavaScript(
+      "window.__atrustRemember && window.__atrustRemember.restore(" + payload + ")"
+    );
+    Log.info(
+      LOG_TAG,
+      "credential restored into login page for user: " + cred.u +
+      " allowSubmit=" + allowSubmit + " win=" + kind + " result=" + JSON.stringify(r)
+    );
   } catch (e) {
     Log.warn(LOG_TAG, "restore failed: " + errText(e));
   }
 }
 
-function inject(win) {
+function inject(win, reason) {
   const wc = win.webContents;
+  if (!wc || wc.isDestroyed()) return;
   if (!rendererSrc) {
-    rendererSrc = fs.readFileSync(RENDERER_FILE, "utf8");
+    try {
+      rendererSrc = fs.readFileSync(RENDERER_FILE, "utf8");
+    } catch (e) {
+      Log.error(LOG_TAG, "read renderer script failed: " + errText(e));
+      return;
+    }
   }
+  const first = !wc.__atrustInjected;
   wc.executeJavaScript(rendererSrc)
     .then(() => {
-      Log.info(LOG_TAG, "renderer script injected");
-      setTimeout(() => restoreTo(win), 600);
-      setTimeout(() => probe(win, 0), 800);
-      if (diagFlags().gotoLogin) setTimeout(() => gotoLogin(win), 1500);
-      startPolling(win);
-      // 已有本地凭据 => 掉线/重启后自动进入登录页并回填
-      ensureCredential().then((cred) => {
-        if (cred) setTimeout(() => autoGoLogin(win), 1800);
-      });
+      if (first) {
+        wc.__atrustInjected = true;
+        Log.info(LOG_TAG, "renderer script injected");
+        setTimeout(() => restoreTo(win), 600);
+        setTimeout(() => probe(win, 0), 800);
+        if (diagFlags().gotoLogin) setTimeout(() => gotoLogin(win), 1500);
+        startPolling(win);
+        // 已有本地凭据 => 掉线/重启后自动进入登录页并回填
+        ensureCredential().then((cred) => {
+          if (cred) setTimeout(() => autoGoLogin(win), 1800);
+        });
+      } else {
+        /* 同一个渲染进程里已经注入过了（SPA 路由变化 / 重复触发）。
+         * 渲染脚本自身是幂等的：重复执行只会调用一次 revive()，
+         * 解除「已回填」粘滞状态并立即重试回填，不会重复安装事件监听。 */
+        Log.info(LOG_TAG, "renderer re-activated (" + (reason || "spa") + ")");
+        setTimeout(() => restoreTo(win), 400);
+      }
     })
     .catch((e) => Log.warn(LOG_TAG, "inject failed: " + errText(e)));
 }
@@ -746,11 +833,12 @@ function startPolling(win) {
     )
       .then((res) => {
         if (!res) return;
-        // 渲染进程检测到登录框 → 主动请求回填（门户 hash 路由跳转时不会触发导航事件）
-        if (res.needRestore) {
-          restoreTo(win);
-          return;
-        }
+        /* 处理顺序很重要：
+         * clear / fail 优先（服务端拒绝或用户取消勾选 → 必须立刻停掉自动重试），
+         * 其次保存「刚刚捕获到的明文密码」，
+         * 最后才处理 needRestore（渲染进程请求回填）。
+         * v1.2 起 needRestore 与待保存凭据可能出现在同一次 peek 里，
+         * 这里不能因为 needRestore 就提前 return，否则密码会一直存不进去。 */
         if (res.clear) {
           clearCredential();
           wc.executeJavaScript(
@@ -772,6 +860,10 @@ function startPolling(win) {
             wc.executeJavaScript("window.__atrustRemember && window.__atrustRemember.clearPending()").catch(() => {});
           });
         }
+        // 渲染进程检测到登录框 → 主动请求回填（门户 hash 路由跳转时不会触发导航事件）
+        if (res.needRestore) {
+          restoreTo(win);
+        }
       })
       .catch(() => {});
   }, POLL_INTERVAL_MS);
@@ -784,10 +876,22 @@ function hookWindow(win, opts) {
     const wc = win.webContents;
     if (wc.__atrustRememberHooked) return;
     wc.__atrustRememberHooked = true;
-    const onLoad = () => setTimeout(() => inject(win), 250);
+    hookedWindows.add(win);
+    const onLoad = () => setTimeout(() => inject(win, "load"), 250);
+    /* 门户是 SPA，用 **hash 路由** 在同一个文档内跳转（#/app_center → #/login）。
+     * 这种跳转既不触发 did-navigate 也不触发 did-finish-load，
+     * 只会触发 did-navigate-in-page —— 掉线自动回到登录页时全靠这个事件。
+     * v1.1 漏了这个监听，导致掉线后主窗口既没有被重新激活、凭据也没有推过去。 */
+    const onInPage = (event, url) => {
+      const u = String(url || "");
+      if (!/#\/login/i.test(u)) return; // 其它 hash 变化由渲染进程自愈处理，不必打扰
+      Log.info(LOG_TAG, "SPA route changed to #/login -> reactivating patch");
+      setTimeout(() => inject(win, "spa-login"), 300);
+    };
     wc.on("did-finish-load", onLoad);
     wc.on("did-navigate", onLoad);
-    if (!wc.isLoading()) setTimeout(() => inject(win), 250);
+    wc.on("did-navigate-in-page", onInPage);
+    if (!wc.isLoading()) setTimeout(() => inject(win, "load"), 250);
   } catch (e) {
     Log.warn(LOG_TAG, "hookWindow failed: " + errText(e));
   }
@@ -796,7 +900,7 @@ function hookWindow(win, opts) {
 function init() {
   try {
     rendererSrc = fs.readFileSync(RENDERER_FILE, "utf8");
-    Log.info(LOG_TAG, "module initialized, data dir: " + DATA_DIR);
+    Log.info(LOG_TAG, "module initialized (v" + PATCH_VERSION + "), data dir: " + DATA_DIR);
     // 延迟探测进程内 DPAPI：确认 ffi 运行时能加载并完成一次真实往返。
     // 放在 setTimeout 里，即使加载原生模块出问题也不会影响客户端启动。
     setTimeout(() => {

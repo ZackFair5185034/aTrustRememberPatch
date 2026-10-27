@@ -170,6 +170,23 @@ function Get-PatchState {
         CredSize     = 0
         CredIsDpapi  = $false
         ClientStatus = '未知'
+        InstalledVer = '未安装'
+        SrcVer       = '未知'
+    }
+
+    # 补丁版本号（主模块里的 PATCH_VERSION 常量）
+    $verTargets = @(
+        [pscustomobject]@{ Path = (Join-Path $ServiceDir 'atrust_remember.js'); Key = 'InstalledVer' }
+        [pscustomobject]@{ Path = (Join-Path $PatchDir 'atrust_remember.js');    Key = 'SrcVer' }
+    )
+    foreach ($spec in $verTargets) {
+        try {
+            if (Test-Path $spec.Path) {
+                $t = [IO.File]::ReadAllText($spec.Path)
+                $m = [regex]::Match($t, 'PATCH_VERSION\s*=\s*"([^"]+)"')
+                if ($m.Success) { $state[$spec.Key] = $m.Groups[1].Value }
+            }
+        } catch { }
     }
 
     if ($state.UtilExists) {
@@ -208,6 +225,8 @@ function Show-State {
     param([switch]$AsLog)
     $s = Get-PatchState
     $lines = @()
+    $lines += ('补丁版本        : 包内 {0} / 已安装 {1}{2}' -f $s.SrcVer, $s.InstalledVer,
+                $(if ($s.InstalledVer -ne '未安装' -and $s.InstalledVer -ne $s.SrcVer) { '  ← 版本不一致，建议重新安装' } else { '' }))
     $lines += ('补丁文件        : {0} / {1} {2}' -f $s.PatchFiles.Count, $PatchFiles.Count, $(if ($s.PatchMissing.Count) { '缺少 ' + ($s.PatchMissing -join ', ') } else { '' }))
     $lines += ('util.js 钩子    : {0}' -f $(if ($s.UtilPatched) { '已注入' } else { '未注入' }))
     $lines += ('原始文件备份    : {0}' -f $(if ($s.BackupExists) { '存在 ' + $BackupFile } else { '不存在' }))

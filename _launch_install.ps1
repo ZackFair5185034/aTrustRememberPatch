@@ -8,10 +8,10 @@ $dir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $log = Join-Path $dir 'install-output.log'
 try {
-    $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $dir 'install.ps1') 2>&1 | Out-String
+    $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $dir 'setup.ps1') -Action install 2>&1 | Out-String
     $code = $LASTEXITCODE
     $out | Out-File -LiteralPath $log -Encoding utf8
-    ("`n### install.ps1 exit code: $code") | Out-File -LiteralPath $log -Encoding utf8 -Append
+    ("`n### setup.ps1 -Action install exit code: $code") | Out-File -LiteralPath $log -Encoding utf8 -Append
 } catch {
     ("EXCEPTION: " + $_.Exception.Message) | Out-File -LiteralPath $log -Encoding utf8
 }

@@ -1,8 +1,16 @@
 # aTrustRemember —— aTrust 客户端「记住密码 / 掉线自动登录」补丁
 
-给深信服 aTrust 客户端（2.5.16.20）补上**掉线后自动登录**能力。
+给本机的深信服 aTrust 客户端（2.5.16.20）补上**掉线后自动登录**能力。
 
-> **状态：已在测试机完整验证通过**（冷启动 → 自动回填 → 自动提交 → 登录成功，端到端零人工干预）。
+> **当前版本：v1.2**（修复「自动注销后没有自动登录」）
+>
+> - **v1.2** 修复了门户 SPA 重绘登录表单后不再回填的缺陷，并补上 `did-navigate-in-page` 监听。
+>   现场定位与回归测试见 [§ v1.2 修复记录](#v12-修复记录2026-10-27现场问题自动注销后没有自动登录)。
+> - **v1.1** 交互式一体安装脚本（安装 / 卸载 / 状态）、进程内 DPAPI 主通道。
+> - **v1.0** 初版。
+
+> **状态：已在本机完整验证通过**（冷启动 → 自动回填 → 自动提交 → 登录成功，端到端零人工干预）。
+> v1.2 的渲染逻辑另有 jsdom 回归测试覆盖（23/23 通过，v1.1 对照组 3 项失败）。
 
 ---
 
@@ -225,15 +233,63 @@ input[name=csrf-token][type=hidden]                   ← 防重放 token
 ### 一个容易踩的坑：门户用 hash 路由跳转，不会触发导航事件
 
 门户是 `index.html?...#/login` 这样的 **hash 路由 SPA**。从面板页跳到登录页**不会**触发
-Electron 的 `did-navigate` / `did-finish-load`，所以「主进程在导航事件里推送凭据」的做法会漏。
+Electron 的 `did-navigate` / `did-finish-load`，只会触发 `did-navigate-in-page`。
+所以「主进程在导航事件里推送凭据」的做法会漏 —— 这正是 v1.1 在真机上失效的直接原因。
 
-补丁因此做成**双向**：
+v1.2 的处理是**三路兜底**：
 
-- 主进程 → 渲染进程：`restore({u,p,allowSubmit})` 回填（导航事件时推送）
-- 渲染进程 → 主进程：`peek()` 返回 `needRestore:true`（渲染进程自己发现登录框出现了），
-  主进程轮询到就补一次回填
+- **主进程 → 渲染进程**：`restore({u,p,allowSubmit})` 回填
+  - `did-finish-load` / `did-navigate`：整页加载
+  - `did-navigate-in-page`（**v1.2 新增**）：SPA hash 路由跳到 `#/login` 时重新激活补丁
+- **渲染进程 → 主进程**：`peek()` 返回 `needRestore:true`
+  （渲染进程自己发现「可见的密码框存在且值为空」，主进程轮询到就补一次回填）
+- **渲染进程自愈**：渲染进程每 1 秒自检一次，
+  只要手里的凭据还在、密码框是空的，就地回填 —— 不需要主进程参与
 
-两条路都通，任何一种跳转方式都不漏。
+> **v1.1 的两个致命缺陷（已由 v1.2 修复）**
+>
+> 1. **渲染进程的 `state.applied` 是粘滞的布尔量。**
+>    门户掉线后会**重绘**登录表单（生成一个新的 password 输入框元素），
+>    而 `applied` 永远是 `true`，于是
+>    `tick()` 的 `restoreReq && !applied` 和 `peek()` 的 `!applied && findPswInput()`
+>    两个判据同时失效 —— 既不回填、也不索要凭据。
+>    v1.2 改成按 **密码框元素身份 + 当前值** 判断：只有密码框为空（或只剩原生掩码）才回填，
+>    表单重绘 → 元素变了、值为空 → 自动重新回填；
+>    用户自己敲了密码 → 不覆盖、也不自动提交。
+>
+> 2. **主进程没监听 `did-navigate-in-page`。**
+>    掉线回到登录页时主窗口既不会被重新激活、凭据也不会推给主窗口。
+>
+> 现场证据见 §「v1.2 修复记录」。
+
+### v1.2 修复记录（2026-10-27，现场问题：「自动注销后没有自动登录」）
+
+**现场日志定位**（用户导出的 `aTrustTray.20261027.log`）：
+
+| 时间 | 事件 |
+|---|---|
+| `22:04:28.43` | `statusEvent\|logout {"type":"reachOnlineDurationLogout"}` ← 在线时长到期被服务端下线 |
+| `22:04:28.66` | `MainWindow did-navigate-in-page, url: .../web/index.html?...#/login` ← **hash 路由** |
+| `22:04:28.90` | `loadAuthView` ← 登录表单确实渲染出来了 |
+| `22:04:28.90 / 29.08` | `renderer script injected` ×2 ← 只有 NotifyWindow / PanelWindow，**主窗口没有** |
+| `22:04:29.50 / 29.68` | `credential restored ...` ×2 ← 凭据推给了面板/通知窗口，**没推给主窗口** |
+| `22:24:44` | 用户手动登录（空窗 20 分钟） |
+
+同时，对比同一台机器上 `13:01` 那次**成功**的自动登录可以确认：
+成功那次门户日志是 `init auth from cache` + `loadAuthView`，
+且渲染进程里 `state.applied` 是在更早的一次回填中就已经置 `true` 的。
+
+**回归测试**（`tools/test-renderer.js`，jsdom 仿真门户登录页）：
+
+| 脚本 | 结果 |
+|---|---|
+| v1.2 | **23 passed, 0 failed** |
+| v1.1（对照组） | 20 passed, **3 failed** ← 恰好挂在「SPA 重绘后回填」「密码框被清空后自愈」两条 |
+
+```
+node tools\test-renderer.js                    # 测当前包里的 v1.2
+node tools\test-renderer.js <旧版渲染脚本路径>   # 拿旧版当对照组
+```
 
 ### 诊断开关（可选）
 
@@ -494,6 +550,8 @@ aTrustRememberPatch\
 ├─ install.ps1                         兼容入口 → setup.ps1 -Action install
 ├─ uninstall.ps1                       兼容入口 → setup.ps1 -Action uninstall
 ├─ _launch_install.ps1                 UAC 提权启动器（可选，一键提权安装）
+├─ _package.ps1                        打包 + 同步到桌面（生成 aTrustRememberPatch-v1.2.zip）
+├─ _sync_live.ps1                      把新版本就地同步进已有副本目录
 ├─ build-vendor.ps1                    从 npm 包裁剪出运行期最小依赖树（生成 vendor\）
 ├─ verify-credential.js                校验 credential.bin（DPAPI blob / 无明文 / 可解密）
 ├─ test-dpapi.js                       DPAPI 往返自测（node test-dpapi.js）
@@ -507,6 +565,7 @@ aTrustRememberPatch\
 │  ├─ atrust_remember_dpapi_ffi.js     进程内 DPAPI（ffi-napi 直调 crypt32）★
 │  └─ atrust_remember_dpapi.js         DPAPI 辅助子进程（兜底通道，现已不作为主路径）
 └─ tools\                              开发期诊断脚本（不影响运行，部署时不需要）
+   ├─ test-renderer.js                 ★ 渲染逻辑回归测试（jsdom 仿真登录页，v1.2: 23/23）
    ├─ diag-spawn.js / diag-one.js      进程创建能力探测
    ├─ env-repro.js / r5-repro.js       自举通道复现
    ├─ helper_test.js                   helper 通道往返
@@ -540,5 +599,3 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build-vendor.ps1
   也不包含任何真实凭据、账号或公司内网信息。
 - 项目作者与深信服无隶属关系；本仓库仅为个人自用的客户端补丁，
   不代表官方立场。使用前请自行评估 §八 的合规风险。
-
----
